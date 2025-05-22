@@ -105,8 +105,10 @@ impl HttpError {
             if let Some(e) = e.downcast_ref::<hyper::Error>() {
                 if e.is_closed() || e.is_incomplete_message() || e.is_body_write_aborted() {
                     kind = HttpErrorKind::Request;
+                    break;
                 } else if e.is_timeout() {
                     kind = HttpErrorKind::Timeout;
+                    break;
                 }
             }
             if let Some(e) = e.downcast_ref::<std::io::Error>() {
@@ -118,6 +120,7 @@ impl HttpError {
                     | std::io::ErrorKind::UnexpectedEof => kind = HttpErrorKind::Interrupted,
                     _ => {}
                 }
+                break;
             }
             source = e.source();
         }
