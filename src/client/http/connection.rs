@@ -105,10 +105,11 @@ impl HttpError {
             if let Some(e) = e.downcast_ref::<hyper::Error>() {
                 if e.is_closed() || e.is_incomplete_message() || e.is_body_write_aborted() {
                     kind = HttpErrorKind::Request;
+                    break;
                 } else if e.is_timeout() {
                     kind = HttpErrorKind::Timeout;
+                    break;
                 }
-                break;
             }
             if let Some(e) = e.downcast_ref::<std::io::Error>() {
                 match e.kind() {
