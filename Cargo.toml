@@ -98,7 +98,7 @@ features = ["wasm_js"]
 
 [dev-dependencies.getrandom_v02]
 package = "getrandom"
-version = "0.2"
+version = "0.4"
 features = ["js"]
 
 [[test]]
