@@ -77,10 +77,13 @@ impl HttpError {
     where
         E: Error + Send + Sync + 'static,
     {
-        Self {
-            kind,
-            source: Box::new(e),
-        }
+        Self::new_boxed(kind, Box::new(e))
+    }
+
+    #[inline]
+    /// Create a new [`HttpError`] with provided `source` error
+    pub fn new_boxed(kind: HttpErrorKind, source: Box<dyn Error + Send + Sync>) -> Self {
+        Self { kind, source }
     }
 
     pub(crate) fn reqwest(e: reqwest::Error) -> Self {
