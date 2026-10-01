@@ -75,8 +75,8 @@ impl HttpRequestBody {
     pub fn is_empty(&self) -> bool {
         match &self.0 {
             Inner::Bytes(x) => x.is_empty(),
-            Inner::PutPayload(_, x) => x.iter().any(|x| !x.is_empty()),
-            Inner::Streaming(x) => x.payload.content_length() != 0,
+            Inner::PutPayload(_, x) => x.content_length() == 0,
+            Inner::Streaming(x) => x.payload.content_length() == 0,
         }
     }
 
@@ -322,6 +322,15 @@ mod tests {
     fn byte_backed_put_payload_uses_synchronous_body() {
         let body = HttpRequestBody::from(PutPayload::from_static(b"payload"));
         assert!(matches!(&body.0, Inner::PutPayload(0, _)));
+    }
+
+    #[test]
+    fn is_empty() {
+        let stream = || futures_util::stream::empty::<Result<Bytes, io::Error>>();
+        assert!(HttpRequestBody::from(PutPayload::new()).is_empty());
+        assert!(HttpRequestBody::from(PutPayload::from_stream(stream, 0)).is_empty());
+        assert!(!HttpRequestBody::from(PutPayload::from_static(b"payload")).is_empty());
+        assert!(!HttpRequestBody::from(PutPayload::from_stream(stream, 7)).is_empty());
     }
 
     #[tokio::test]
