@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::aws::chunked::ChunkSigner;
 use crate::aws::{AwsCredentialProvider, STORE, STRICT_ENCODE_SET, STRICT_PATH_ENCODE_SET};
 use crate::client::builder::HttpRequestBuilder;
 use crate::client::retry::RetryExt;
@@ -65,7 +66,8 @@ impl From<Error> for crate::Error {
 type StdError = Box<dyn std::error::Error + Send + Sync>;
 
 /// SHA256 hash of empty string
-static EMPTY_SHA256_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+pub(crate) static EMPTY_SHA256_HASH: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 static UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 static STREAMING_PAYLOAD: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 
@@ -91,17 +93,16 @@ impl std::fmt::Debug for AwsCredential {
 }
 
 impl AwsCredential {
-    /// Signs a string
+    /// Derives the SigV4 signing key for `date`, `region` and `service`
     ///
-    /// <https://docs.aws.amazon.com/general/latest/gr/sigv4-calculate-signature.html>
-    fn sign(
+    /// <https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html#derive-signing-key>
+    pub(crate) fn signing_key(
         &self,
         crypto: &dyn CryptoProvider,
-        to_sign: &str,
         date: DateTime<Utc>,
         region: &str,
         service: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<u8>> {
         let date_string = date.format("%Y%m%d").to_string();
         let secret_key = format!("AWS4{}", self.secret_key);
 
@@ -117,7 +118,22 @@ impl AwsCredential {
         let mut ctx = crypto.hmac(DigestAlgorithm::Sha256, ctx.finish()?)?;
         ctx.update(b"aws4_request");
 
-        let mut ctx = crypto.hmac(DigestAlgorithm::Sha256, ctx.finish()?)?;
+        Ok(ctx.finish()?.to_vec())
+    }
+
+    /// Signs a string
+    ///
+    /// <https://docs.aws.amazon.com/general/latest/gr/sigv4-calculate-signature.html>
+    fn sign(
+        &self,
+        crypto: &dyn CryptoProvider,
+        to_sign: &str,
+        date: DateTime<Utc>,
+        region: &str,
+        service: &str,
+    ) -> Result<String> {
+        let signing_key = self.signing_key(crypto, date, region, service)?;
+        let mut ctx = crypto.hmac(DigestAlgorithm::Sha256, &signing_key)?;
         ctx.update(to_sign.as_bytes());
 
         Ok(hex_encode(ctx.finish()?))
@@ -219,19 +235,6 @@ impl<'a> AwsAuthorizer<'a> {
         pre_calculated_digest: Option<&[u8]>,
     ) -> Result<()> {
         let crypto = crypto_provider(self.crypto)?;
-        let url = Url::parse(&request.uri().to_string()).unwrap();
-
-        if let Some(ref token) = self.credential.token {
-            let token_val = HeaderValue::from_str(token).unwrap();
-            let header = self.token_header.as_ref().unwrap_or(&TOKEN_HEADER);
-            request.headers_mut().insert(header, token_val);
-        }
-
-        let date = self.date.unwrap_or_else(Utc::now);
-        let date_str = date.format("%Y%m%dT%H%M%SZ").to_string();
-        let date_val = HeaderValue::from_str(&date_str).unwrap();
-        request.headers_mut().insert(&DATE_HEADER, date_val);
-
         let digest = match self.sign_payload {
             false => UNSIGNED_PAYLOAD.to_string(),
             true => match pre_calculated_digest {
@@ -246,7 +249,66 @@ impl<'a> AwsAuthorizer<'a> {
             },
         };
 
-        let header_digest = HeaderValue::from_str(&digest).unwrap();
+        self.sign_request(crypto, request, &digest)?;
+        Ok(())
+    }
+
+    /// Authorize `request` for an [aws-chunked] streaming upload, returning the
+    /// [`ChunkSigner`] that signs its body
+    ///
+    /// The request must already carry the `content-encoding`,
+    /// `x-amz-decoded-content-length` and encoded `content-length` headers, and
+    /// this [`AwsAuthorizer`] must be configured to sign payloads.
+    ///
+    /// `custom_crypto` must be an owned handle to the custom [`CryptoProvider`]
+    /// this [`AwsAuthorizer`] was configured with, if any. The returned signer
+    /// uses it to sign the body chunks for every upload attempt.
+    ///
+    /// [aws-chunked]: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming.html
+    pub(crate) fn try_authorize_aws_chunked(
+        &self,
+        request: &mut HttpRequest,
+        custom_crypto: Option<Arc<dyn CryptoProvider>>,
+    ) -> Result<ChunkSigner> {
+        debug_assert!(self.sign_payload);
+        let crypto = crypto_provider(self.crypto)?;
+        let (date, seed_signature) = self.sign_request(crypto, request, STREAMING_PAYLOAD)?;
+        let signing_key = self
+            .credential
+            .signing_key(crypto, date, self.region, self.service)?;
+        Ok(ChunkSigner::new(
+            custom_crypto,
+            signing_key,
+            date,
+            self.scope(date),
+            seed_signature,
+        ))
+    }
+
+    /// Attaches the [AWS SigV4] headers to `request` using the payload `digest`,
+    /// returning the signing date and the request signature
+    ///
+    /// [AWS SigV4]: https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html
+    fn sign_request(
+        &self,
+        crypto: &dyn CryptoProvider,
+        request: &mut HttpRequest,
+        digest: &str,
+    ) -> Result<(DateTime<Utc>, String)> {
+        let url = Url::parse(&request.uri().to_string()).unwrap();
+
+        if let Some(ref token) = self.credential.token {
+            let token_val = HeaderValue::from_str(token).unwrap();
+            let header = self.token_header.as_ref().unwrap_or(&TOKEN_HEADER);
+            request.headers_mut().insert(header, token_val);
+        }
+
+        let date = self.date.unwrap_or_else(Utc::now);
+        let date_str = date.format("%Y%m%dT%H%M%SZ").to_string();
+        let date_val = HeaderValue::from_str(&date_str).unwrap();
+        request.headers_mut().insert(&DATE_HEADER, date_val);
+
+        let header_digest = HeaderValue::from_str(digest).unwrap();
         request.headers_mut().insert(&HASH_HEADER, header_digest);
 
         if self.request_payer {
@@ -278,7 +340,7 @@ impl<'a> AwsAuthorizer<'a> {
             &url,
             &canonical_headers,
             &signed_headers,
-            &digest,
+            digest,
         )?;
 
         // sign the string
@@ -296,7 +358,7 @@ impl<'a> AwsAuthorizer<'a> {
         request
             .headers_mut()
             .insert(&AUTHORIZATION, authorization_val);
-        Ok(())
+        Ok((date, signature))
     }
 
     /// Generate a presigned URL, additionally folding `extra_query` parameters and

@@ -119,6 +119,19 @@ impl PutPayload {
         })
     }
 
+    /// Creates a replayable streaming [`PutPayload`] from a factory of
+    /// [`PutPayloadStream`], see [`Self::from_stream`]
+    #[cfg(feature = "aws-base")]
+    pub(crate) fn from_payload_stream<F>(stream_factory: F, content_length: usize) -> Self
+    where
+        F: Fn() -> PutPayloadStream + Send + Sync + 'static,
+    {
+        Self(PutPayloadInner::Streaming {
+            factory: Arc::new(stream_factory),
+            content_length,
+        })
+    }
+
     /// Creates a replayable streaming payload from a file.
     ///
     /// The file is read in 16 KiB chunks and reopened for every upload attempt.

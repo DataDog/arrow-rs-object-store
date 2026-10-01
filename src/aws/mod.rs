@@ -58,6 +58,7 @@ static COPY_SOURCE_HEADER: HeaderName = HeaderName::from_static("x-amz-copy-sour
 
 mod builder;
 mod checksum;
+mod chunked;
 mod client;
 mod credential;
 mod precondition;
