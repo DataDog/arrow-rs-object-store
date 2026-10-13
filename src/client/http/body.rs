@@ -63,12 +63,17 @@ impl HttpRequestBody {
     }
 
     #[cfg(all(feature = "reqwest", target_arch = "wasm32", target_os = "unknown"))]
-    pub(crate) fn into_reqwest(self) -> reqwest::Body {
-        match self.0 {
-            Inner::Bytes(b) => b.into(),
-            Inner::PutPayload(_, payload) => Bytes::from(payload).into(),
-            Inner::Streaming(body) => Bytes::from(body.payload).into(),
-        }
+    pub(crate) async fn into_reqwest(self) -> Result<reqwest::Body, HttpError> {
+        let bytes = match self.0 {
+            Inner::Bytes(b) => b,
+            Inner::PutPayload(_, payload) => Bytes::from(payload),
+            Inner::Streaming(body) => body
+                .payload
+                .bytes()
+                .await
+                .map_err(|e| HttpError::new_boxed(HttpErrorKind::Unknown, e))?,
+        };
+        Ok(bytes.into())
     }
 
     /// Returns true if this body is empty
@@ -351,5 +356,53 @@ mod tests {
             assert_eq!(body.content_length(), 11);
             assert_eq!(body.collect().await.unwrap().to_bytes(), "hello world");
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "reqwest",
+    target_arch = "wasm32",
+    target_os = "unknown"
+))]
+mod wasm_tests {
+    use super::*;
+    use std::io;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    async fn streaming_reqwest_body_collects_and_replays() {
+        let payload = PutPayload::from_stream(
+            || {
+                futures_util::stream::iter([
+                    Ok::<_, io::Error>(Bytes::from_static(b"hello ")),
+                    Ok(Bytes::from_static(b"world")),
+                ])
+            },
+            11,
+        );
+        let body = HttpRequestBody::from(payload);
+        for body in [body.clone(), body] {
+            let body = body.into_reqwest().await.unwrap();
+            assert_eq!(body.as_bytes(), Some(b"hello world".as_slice()));
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn streaming_reqwest_body_propagates_errors() {
+        let payload = PutPayload::from_stream(
+            || {
+                futures_util::stream::once(async {
+                    Err::<Bytes, _>(io::Error::other("source read failed"))
+                })
+            },
+            1,
+        );
+        let err = HttpRequestBody::from(payload)
+            .into_reqwest()
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), HttpErrorKind::Unknown);
+        assert!(err.to_string().contains("source read failed"));
     }
 }
