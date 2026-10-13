@@ -18,7 +18,7 @@
 //! An in-memory object store implementation
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -205,9 +205,16 @@ impl ObjectStore for InMemory {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
+        let payload = payload
+            .bytes()
+            .await
+            .map_err(|source| crate::Error::Generic {
+                store: "InMemory",
+                source,
+            })?;
         let mut storage = self.storage.write();
         let etag = storage.next_etag;
-        let entry = Entry::new(payload.into(), Utc::now(), etag, opts.attributes);
+        let entry = Entry::new(payload, Utc::now(), etag, opts.attributes);
 
         match opts.mode {
             PutMode::Overwrite => storage.overwrite(location, entry),
@@ -450,12 +457,19 @@ impl MultipartStore for InMemory {
         part_idx: usize,
         payload: PutPayload,
     ) -> Result<PartId> {
+        let payload = payload
+            .bytes()
+            .await
+            .map_err(|source| crate::Error::Generic {
+                store: "InMemory",
+                source,
+            })?;
         let mut storage = self.storage.write();
         let upload = storage.upload_mut(id)?;
         if part_idx >= upload.parts.len() {
             upload.parts.resize(part_idx + 1, None);
         }
-        upload.parts[part_idx] = Some(payload.into());
+        upload.parts[part_idx] = Some(payload);
         Ok(PartId {
             content_id: Default::default(),
         })
@@ -524,22 +538,42 @@ impl InMemory {
 struct InMemoryUpload {
     location: Path,
     attributes: Attributes,
-    parts: Vec<PutPayload>,
+    parts: Vec<Arc<OnceLock<Bytes>>>,
     storage: Arc<RwLock<Storage>>,
 }
 
 #[async_trait]
 impl MultipartUpload for InMemoryUpload {
     fn put_part(&mut self, payload: PutPayload) -> UploadPart {
-        self.parts.push(payload);
-        Box::pin(futures_util::future::ready(Ok(())))
+        let part = Arc::new(OnceLock::new());
+        self.parts.push(Arc::clone(&part));
+        Box::pin(async move {
+            let bytes = payload
+                .bytes()
+                .await
+                .map_err(|source| crate::Error::Generic {
+                    store: "InMemory",
+                    source,
+                })?;
+            // Each slot is filled by exactly one upload future. Slots preserve
+            // submission order even when the futures complete out of order.
+            part.set(bytes).expect("part is only uploaded once");
+            Ok(())
+        })
     }
 
     async fn complete(&mut self) -> Result<PutResult> {
-        let cap = self.parts.iter().map(|x| x.content_length()).sum();
+        let parts = self
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(part, slot)| slot.get().ok_or(Error::MissingPart { part }))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let cap = parts.iter().map(|part| part.len()).sum();
         let mut buf = Vec::with_capacity(cap);
-        let parts = self.parts.iter().flatten();
-        parts.for_each(|x| buf.extend_from_slice(x));
+        for part in parts {
+            buf.extend_from_slice(part);
+        }
         let etag = self.storage.write().insert(
             &self.location,
             buf.into(),
@@ -563,6 +597,89 @@ mod tests {
     use crate::{ObjectStoreExt, integration::*};
 
     use super::*;
+
+    #[tokio::test]
+    async fn streaming_parts_preserve_submission_order() {
+        let store = InMemory::new();
+        let object = Path::from("object");
+        let mut upload = store.put_multipart(&object).await.unwrap();
+        let payload = |bytes| {
+            PutPayload::from_stream(
+                move || {
+                    futures_util::stream::once(async move {
+                        Ok::<_, std::io::Error>(Bytes::from_static(bytes))
+                    })
+                },
+                5,
+            )
+        };
+        let first = upload.put_part(payload(b"first"));
+        let second = upload.put_part(payload(b"later"));
+        second.await.unwrap();
+        first.await.unwrap();
+        upload.complete().await.unwrap();
+        assert_eq!(
+            store.get(&object).await.unwrap().bytes().await.unwrap(),
+            "firstlater"
+        );
+    }
+
+    #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn uploaded_part_should_survive_source_removal() {
+        let store = InMemory::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part");
+        tokio::fs::write(&path, b"original").await.unwrap();
+        let mut upload = store.put_multipart(&Path::from("object")).await.unwrap();
+        upload
+            .put_part(PutPayload::from_file(&path).await.unwrap())
+            .await
+            .unwrap();
+        tokio::fs::remove_file(&path).await.unwrap();
+        upload
+            .complete()
+            .await
+            .expect("a completed part must no longer need its source");
+    }
+
+    #[tokio::test]
+    async fn put_part_should_propagate_stream_error() {
+        let store = InMemory::new();
+        let mut upload = store.put_multipart(&Path::from("object")).await.unwrap();
+        let payload = PutPayload::from_stream(
+            || {
+                futures_util::stream::once(async {
+                    Err::<Bytes, _>(std::io::Error::other("source read failed"))
+                })
+            },
+            1,
+        );
+        assert!(
+            upload.put_part(payload).await.is_err(),
+            "put_part must read and validate the part before succeeding"
+        );
+    }
+
+    #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn uploaded_parts_should_capture_their_original_bytes() {
+        let store = InMemory::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part");
+        let object = Path::from("object");
+        let mut upload = store.put_multipart(&object).await.unwrap();
+        for data in [b"first", b"later"] {
+            tokio::fs::write(&path, data).await.unwrap();
+            upload
+                .put_part(PutPayload::from_file(&path).await.unwrap())
+                .await
+                .unwrap();
+        }
+        upload.complete().await.unwrap();
+        let result = store.get(&object).await.unwrap().bytes().await.unwrap();
+        assert_eq!(result, "firstlater");
+    }
 
     #[tokio::test]
     async fn in_memory_test() {

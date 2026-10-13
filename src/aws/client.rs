@@ -17,6 +17,7 @@
 
 use crate::aws::builder::S3EncryptionHeaders;
 use crate::aws::checksum::Checksum;
+use crate::aws::chunked;
 use crate::aws::credential::{AwsCredential, CredentialExt};
 use crate::aws::{
     AwsAuthorizer, AwsCredentialProvider, COPY_SOURCE_HEADER, S3ConditionalPut, S3CopyIfNotExists,
@@ -33,8 +34,8 @@ use crate::client::s3::{
     InitiateMultipartUploadResult, ListResponse, PartMetadata,
 };
 use crate::client::{
-    CryptoProvider, DigestAlgorithm, GetOptionsExt, HttpClient, HttpError, HttpResponse,
-    crypto_provider,
+    CryptoProvider, DigestAlgorithm, GetOptionsExt, HttpClient, HttpError, HttpRequest,
+    HttpResponse, crypto_provider,
 };
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
@@ -50,7 +51,7 @@ use http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH,
     CONTENT_TYPE,
 };
-use http::{HeaderMap, HeaderName, Method};
+use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use itertools::Itertools;
 use md5::{Digest, Md5};
 use percent_encoding::{PercentEncode, utf8_percent_encode};
@@ -64,6 +65,7 @@ const CRC64NVME_CHECKSUM: &str = "x-amz-checksum-crc64nvme";
 const USER_DEFINED_METADATA_HEADER_PREFIX: &str = "x-amz-meta-";
 const ALGORITHM: &str = "x-amz-checksum-algorithm";
 const STORAGE_CLASS: &str = "x-amz-storage-class";
+const DECODED_CONTENT_LENGTH: HeaderName = HeaderName::from_static("x-amz-decoded-content-length");
 
 /// A specialized `Error` for object store-related errors
 #[derive(Debug, thiserror::Error)]
@@ -306,6 +308,7 @@ pub(crate) struct Request<'a> {
     builder: HttpRequestBuilder,
     payload_sha256: Option<[u8; 32]>,
     payload: Option<PutPayload>,
+    aws_chunked: bool,
     use_session_creds: bool,
     idempotent: bool,
     retry_on_conflict: bool,
@@ -405,40 +408,70 @@ impl Request<'_> {
         Self { builder, ..self }
     }
 
-    pub(crate) fn with_payload(mut self, payload: PutPayload) -> Result<Self> {
-        let mut cached_digest: Option<[u8; 32]> = None;
-        let mut sha256_digest = || -> Result<[u8; 32]> {
-            if let Some(digest) = cached_digest {
-                return Ok(digest);
-            }
-            let mut ctx = self.config.crypto()?.digest(DigestAlgorithm::Sha256)?;
-            for part in &payload {
-                ctx.update(part);
-            }
-            let digest = ctx.finish()?.try_into().unwrap();
-            cached_digest = Some(digest);
-            Ok(digest)
-        };
+    pub(crate) async fn with_payload(mut self, payload: PutPayload) -> Result<Self> {
+        use futures_util::TryStreamExt;
 
-        if !self.config.skip_signature && self.config.sign_payload {
-            self.payload_sha256 = Some(sha256_digest()?);
+        let sign_payload = !self.config.skip_signature && self.config.sign_payload;
+        // Sign streaming payloads chunk by chunk as they are uploaded, rather than
+        // reading them twice, unless a checksum requires a pass over the payload
+        self.aws_chunked = sign_payload && payload.is_streaming() && self.config.checksum.is_none();
+
+        let needs_sha256 =
+            (sign_payload && !self.aws_chunked) || self.config.checksum == Some(Checksum::SHA256);
+        let mut sha256 = needs_sha256
+            .then(|| self.config.crypto()?.digest(DigestAlgorithm::Sha256))
+            .transpose()?;
+        let mut crc64 = (self.config.checksum == Some(Checksum::CRC64NVME)).then(|| {
+            let algorithm = crc_fast::CrcAlgorithm::Crc64Nvme;
+            crc_fast::Digest::new(algorithm)
+        });
+
+        if sha256.is_some() || crc64.is_some() {
+            let mut update_hashes = |part: &[u8]| {
+                if let Some(digest) = &mut sha256 {
+                    digest.update(part);
+                }
+                if let Some(digest) = &mut crc64 {
+                    digest.update(part);
+                }
+            };
+
+            if payload.is_streaming() {
+                let mut stream = payload.stream().map_err(|source| crate::Error::Generic {
+                    store: "S3",
+                    source,
+                });
+                while let Some(part) = stream.try_next().await? {
+                    update_hashes(&part);
+                }
+            } else {
+                for part in &payload {
+                    update_hashes(part);
+                }
+            }
+        }
+
+        let sha256_digest = match sha256 {
+            Some(mut digest) => Some(digest.finish()?.try_into().unwrap()),
+            None => None,
+        };
+        let crc64_checksum = crc64.map(|digest| digest.finalize());
+
+        if sign_payload && !self.aws_chunked {
+            self.payload_sha256 = sha256_digest;
         }
 
         match self.config.checksum {
             Some(Checksum::SHA256) => {
-                self.builder = self
-                    .builder
-                    .header(SHA256_CHECKSUM, BASE64_STANDARD.encode(sha256_digest()?));
+                self.builder = self.builder.header(
+                    SHA256_CHECKSUM,
+                    BASE64_STANDARD.encode(sha256_digest.unwrap()),
+                );
             }
             Some(Checksum::CRC64NVME) => {
-                let crc_algo = crc_fast::CrcAlgorithm::Crc64Nvme;
-                let mut digest = crc_fast::Digest::new(crc_algo);
-                payload.iter().for_each(|x| digest.update(x));
-                let checksum = digest.finalize();
-
                 self.builder = self.builder.header(
                     CRC64NVME_CHECKSUM,
-                    BASE64_STANDARD.encode(checksum.to_be_bytes()),
+                    BASE64_STANDARD.encode(crc64_checksum.unwrap().to_be_bytes()),
                 )
             }
             None => {}
@@ -466,14 +499,26 @@ impl Request<'_> {
 
         let sha = self.payload_sha256.as_ref().map(|x| x.as_ref());
 
+        let (builder, payload) = match (authorizer, self.payload) {
+            (Some(authorizer), Some(payload)) if self.aws_chunked => {
+                let (client, request) = self.builder.into_parts();
+                let mut request = request.expect("request valid");
+                with_aws_chunked_headers(&mut request, payload.content_length());
+                let signer = authorizer
+                    .try_authorize_aws_chunked(&mut request, self.config.crypto.clone())?;
+                let builder = HttpRequestBuilder::from_parts(client, request);
+                (builder, Some(signer.encode(payload)))
+            }
+            (authorizer, payload) => (self.builder.with_aws_sigv4(authorizer, sha)?, payload),
+        };
+
         let path = self.path.as_ref();
-        self.builder
-            .with_aws_sigv4(authorizer, sha)?
+        builder
             .retryable(&self.config.retry_config)
             .retry_on_conflict(self.retry_on_conflict)
             .idempotent(self.idempotent)
             .retry_error_body(self.retry_error_body)
-            .payload(self.payload)
+            .payload(payload)
             .send()
             .await
             .map_err(|source| {
@@ -489,6 +534,27 @@ impl Request<'_> {
                 .map_err(|source| Error::Metadata { source })?,
         )
     }
+}
+
+/// Sets the headers of an [aws-chunked] upload of `content_length` bytes
+///
+/// [aws-chunked]: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming.html
+fn with_aws_chunked_headers(request: &mut HttpRequest, content_length: usize) {
+    let headers = request.headers_mut();
+    let encoding = match headers.get(CONTENT_ENCODING) {
+        Some(existing) => {
+            let mut encoding = existing.as_bytes().to_vec();
+            encoding.extend_from_slice(b",aws-chunked");
+            HeaderValue::from_bytes(&encoding).expect("valid header value")
+        }
+        None => HeaderValue::from_static("aws-chunked"),
+    };
+    headers.insert(CONTENT_ENCODING, encoding);
+    headers.insert(DECODED_CONTENT_LENGTH, content_length.into());
+    headers.insert(
+        CONTENT_LENGTH,
+        chunked::encoded_length(content_length).into(),
+    );
 }
 
 #[derive(Debug)]
@@ -513,6 +579,7 @@ impl S3Client {
             builder,
             payload: None,
             payload_sha256: None,
+            aws_chunked: false,
             config: &self.config,
             use_session_creds: true,
             idempotent: false,
@@ -754,7 +821,7 @@ impl S3Client {
             .idempotent(true);
 
         request = match data {
-            PutPartPayload::Part(payload) => request.with_payload(payload)?,
+            PutPartPayload::Part(payload) => request.with_payload(payload).await?,
             PutPartPayload::Copy(path) => request.header(
                 "x-amz-copy-source",
                 &format!("{}/{}", self.config.bucket, encode_path(path)),
@@ -1164,6 +1231,126 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "reqwest", any(feature = "aws-lc-rs", feature = "ring")))]
+    #[tokio::test]
+    async fn test_payload_hashes_share_stream_pass() {
+        use std::io;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mock = MockServer::new().await;
+        let mut config = default_headers_config(&mock);
+        config.sign_payload = true;
+        config.checksum = Some(Checksum::CRC64NVME);
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+
+        let stream_count = Arc::new(AtomicUsize::new(0));
+        let payload = PutPayload::from_stream(
+            {
+                let stream_count = Arc::clone(&stream_count);
+                move || {
+                    stream_count.fetch_add(1, Ordering::SeqCst);
+                    futures_util::stream::once(async {
+                        Ok::<_, io::Error>(Bytes::from_static(b"payload"))
+                    })
+                }
+            },
+            7,
+        );
+
+        client
+            .request(Method::PUT, &Path::from("test"))
+            .with_payload(payload)
+            .await
+            .unwrap();
+
+        assert_eq!(stream_count.load(Ordering::SeqCst), 1);
+        mock.shutdown().await;
+    }
+
+    #[cfg(all(feature = "reqwest", any(feature = "aws-lc-rs", feature = "ring")))]
+    #[tokio::test]
+    async fn test_streaming_payload_aws_chunked() {
+        use http_body_util::BodyExt;
+        use std::io;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let content = Bytes::from((0..100_000u32).map(|x| x as u8).collect::<Vec<_>>());
+        let encoded_length = chunked::encoded_length(content.len()).to_string();
+
+        let mock = MockServer::new().await;
+        for status in [500, 200] {
+            let content = content.clone();
+            let encoded_length = encoded_length.clone();
+            mock.push_async_fn(move |req| async move {
+                let headers = req.headers();
+                assert_eq!(headers["content-encoding"], "gzip,aws-chunked");
+                assert_eq!(headers["x-amz-decoded-content-length"], "100000");
+                assert_eq!(headers[CONTENT_LENGTH], encoded_length.as_str());
+                assert_eq!(
+                    headers["x-amz-content-sha256"],
+                    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+                );
+                let auth = headers[AUTHORIZATION].to_str().unwrap();
+                assert!(auth.contains("x-amz-decoded-content-length"), "{auth}");
+
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(body.len().to_string(), encoded_length);
+                let mut decoded = Vec::new();
+                let mut rest = &body[..];
+                while !rest.is_empty() {
+                    let end = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+                    let header = std::str::from_utf8(&rest[..end]).unwrap();
+                    let size = usize::from_str_radix(header.split(';').next().unwrap(), 16);
+                    let size = size.unwrap();
+                    decoded.extend_from_slice(&rest[end + 2..end + 2 + size]);
+                    rest = &rest[end + 2 + size + 2..];
+                }
+                assert_eq!(decoded, content);
+
+                Response::builder()
+                    .status(status)
+                    .header("etag", "\"test-etag\"")
+                    .body(String::new())
+                    .unwrap()
+            });
+        }
+
+        let mut config = default_headers_config(&mock);
+        config.sign_payload = true;
+        config.retry_config.backoff.init_backoff = std::time::Duration::from_millis(1);
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+
+        let stream_count = Arc::new(AtomicUsize::new(0));
+        let payload = PutPayload::from_stream(
+            {
+                let stream_count = Arc::clone(&stream_count);
+                let content = content.clone();
+                move || {
+                    stream_count.fetch_add(1, Ordering::SeqCst);
+                    let parts = [content.slice(..30_000), content.slice(30_000..)];
+                    futures_util::stream::iter(parts.into_iter().map(Ok::<_, io::Error>))
+                }
+            },
+            content.len(),
+        );
+
+        let attributes = [(Attribute::ContentEncoding, "gzip")].into_iter().collect();
+        client
+            .request(Method::PUT, &Path::from("test"))
+            .with_payload(payload)
+            .await
+            .unwrap()
+            .with_attributes(attributes)
+            .idempotent(true)
+            .do_put()
+            .await
+            .unwrap();
+
+        // No pass over the payload before the upload, one per attempt
+        assert_eq!(stream_count.load(Ordering::SeqCst), 2);
+        mock.shutdown().await;
+    }
+
     #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_default_headers_signed_request() {
@@ -1182,6 +1369,7 @@ mod tests {
         let result = client
             .request(Method::PUT, &Path::from("test"))
             .with_payload(PutPayload::default())
+            .await
             .unwrap()
             .do_put()
             .await;
