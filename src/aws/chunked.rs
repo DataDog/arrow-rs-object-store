@@ -26,11 +26,12 @@
 use crate::aws::STORE;
 use crate::aws::credential::EMPTY_SHA256_HASH;
 use crate::client::{CryptoProvider, DigestAlgorithm, crypto_provider};
-use crate::util::{hex_digest, hex_encode};
+use crate::util::hex_encode;
 use crate::{PutPayload, PutPayloadError, PutPayloadStream, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, TryStreamExt};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// The size of every chunk but the last two
@@ -113,7 +114,9 @@ impl ChunkSigner {
                     signer: Arc::clone(&signer),
                     source: payload.stream(),
                     source_done: false,
-                    buffer: BytesMut::new(),
+                    pending: VecDeque::new(),
+                    pending_len: 0,
+                    frames: VecDeque::new(),
                     bytes_read: 0,
                     content_length,
                     previous_signature: signer.seed_signature.clone(),
@@ -125,14 +128,18 @@ impl ChunkSigner {
         )
     }
 
-    /// Signs `chunk`, chaining from `previous_signature`
-    fn sign(&self, previous_signature: &str, chunk: &[u8]) -> Result<String> {
+    /// Signs the chunk made of `parts`, chaining from `previous_signature`
+    fn sign(&self, previous_signature: &str, parts: &[Bytes]) -> Result<String> {
         let crypto = crypto_provider(self.crypto.as_deref())?;
+        let mut digest = crypto.digest(DigestAlgorithm::Sha256)?;
+        for part in parts {
+            digest.update(part);
+        }
         let string_to_sign = format!(
             "{CHUNK_ALGORITHM}\n{}\n{}\n{previous_signature}\n{EMPTY_SHA256_HASH}\n{}",
             self.date,
             self.scope,
-            hex_digest(crypto, chunk)?
+            hex_encode(digest.finish()?)
         );
         let mut ctx = crypto.hmac(DigestAlgorithm::Sha256, &self.signing_key)?;
         ctx.update(string_to_sign.as_bytes());
@@ -141,11 +148,18 @@ impl ChunkSigner {
 }
 
 /// The state of one encoding pass over a payload
+///
+/// The source bytes are never copied: a chunk is made of slices of the source
+/// [`Bytes`], and is emitted as its header, those slices and its trailer.
 struct Encoder {
     signer: Arc<ChunkSigner>,
     source: PutPayloadStream,
     source_done: bool,
-    buffer: BytesMut,
+    /// Source bytes read but not yet emitted
+    pending: VecDeque<Bytes>,
+    pending_len: usize,
+    /// Encoded frames ready to be emitted
+    frames: VecDeque<Bytes>,
     bytes_read: usize,
     content_length: usize,
     previous_signature: String,
@@ -155,21 +169,24 @@ struct Encoder {
 impl Encoder {
     fn into_stream(self) -> PutPayloadStream {
         futures_util::stream::try_unfold(self, |mut encoder| async move {
-            match encoder.finished {
-                true => Ok(None),
-                false => Ok(Some((encoder.next_frame().await?, encoder))),
+            if encoder.frames.is_empty() && !encoder.finished {
+                encoder.encode_next_chunk().await?;
             }
+            Ok(encoder.frames.pop_front().map(|frame| (frame, encoder)))
         })
         .boxed()
     }
 
-    /// Reads and encodes the next chunk, the final chunk being empty
-    async fn next_frame(&mut self) -> Result<Bytes, PutPayloadError> {
-        while !self.source_done && self.buffer.len() < CHUNK_SIZE {
+    /// Reads and encodes the next chunk into `frames`, the final chunk being empty
+    async fn encode_next_chunk(&mut self) -> Result<(), PutPayloadError> {
+        while !self.source_done && self.pending_len < CHUNK_SIZE {
             match self.source.try_next().await? {
                 Some(bytes) => {
                     self.bytes_read += bytes.len();
-                    self.buffer.extend_from_slice(&bytes);
+                    self.pending_len += bytes.len();
+                    if !bytes.is_empty() {
+                        self.pending.push_back(bytes);
+                    }
                 }
                 None => self.source_done = true,
             }
@@ -178,23 +195,35 @@ impl Encoder {
             }
         }
 
-        let chunk = self.buffer.split_to(self.buffer.len().min(CHUNK_SIZE));
-        if chunk.is_empty() {
+        let chunk_len = self.pending_len.min(CHUNK_SIZE);
+        let mut parts = Vec::new();
+        let mut remaining = chunk_len;
+        while remaining > 0 {
+            let mut part = self
+                .pending
+                .pop_front()
+                .expect("pending holds chunk_len bytes");
+            if part.len() > remaining {
+                self.pending.push_front(part.split_off(remaining));
+            }
+            remaining -= part.len();
+            parts.push(part);
+        }
+        self.pending_len -= chunk_len;
+        if chunk_len == 0 {
             if self.bytes_read != self.content_length {
                 return Err(self.length_mismatch());
             }
             self.finished = true;
         }
 
-        let signature = self.signer.sign(&self.previous_signature, &chunk)?;
-        let mut frame = BytesMut::with_capacity(frame_length(chunk.len()));
-        frame.extend_from_slice(
-            format!("{:x}{CHUNK_SIGNATURE}{signature}\r\n", chunk.len()).as_bytes(),
-        );
-        frame.extend_from_slice(&chunk);
-        frame.extend_from_slice(b"\r\n");
+        let signature = self.signer.sign(&self.previous_signature, &parts)?;
+        self.frames
+            .push_back(format!("{chunk_len:x}{CHUNK_SIGNATURE}{signature}\r\n").into());
+        self.frames.extend(parts);
+        self.frames.push_back(Bytes::from_static(b"\r\n"));
         self.previous_signature = signature;
-        Ok(frame.freeze())
+        Ok(())
     }
 
     fn length_mismatch(&self) -> PutPayloadError {
@@ -301,6 +330,21 @@ mod tests {
             ]
         );
         assert_eq!(payload, vec![b'a'; 66560]);
+    }
+
+    #[tokio::test]
+    async fn test_does_not_copy_source_bytes() {
+        let source = Bytes::from(vec![b'c'; CHUNK_SIZE + 10]);
+        let encoded = example_signer().encode(payload_of(vec![source.clone()], source.len()));
+
+        let frames: Vec<Bytes> = encoded.stream().try_collect().await.unwrap();
+        let data: Vec<&Bytes> = frames
+            .iter()
+            .filter(|frame| frame.len() == CHUNK_SIZE || frame.len() == 10)
+            .collect();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].as_ptr(), source.as_ptr());
+        assert_eq!(data[1].as_ptr(), source[CHUNK_SIZE..].as_ptr());
     }
 
     #[tokio::test]

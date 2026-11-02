@@ -547,6 +547,13 @@ impl MultipartUpload for InMemoryUpload {
     fn put_part(&mut self, payload: PutPayload) -> UploadPart {
         let part = Arc::new(OnceLock::new());
         self.parts.push(Arc::clone(&part));
+        if !payload.is_streaming() {
+            // Record in-memory parts right away, so that, as before streaming
+            // payloads, they do not depend on the returned future being polled
+            let bytes: Bytes = payload.into();
+            part.set(bytes).expect("part is only uploaded once");
+            return Box::pin(futures_util::future::ready(Ok(())));
+        }
         Box::pin(async move {
             let bytes = payload
                 .bytes()
@@ -749,6 +756,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&*read_data, data);
+    }
+
+    #[tokio::test]
+    async fn multipart_in_memory_parts_do_not_need_polling() {
+        let integration = InMemory::new();
+        let location = Path::from("some_file");
+
+        let mut upload = integration.put_multipart(&location).await.unwrap();
+        drop(upload.put_part(Bytes::from_static(b"hello ").into()));
+        drop(upload.put_part(Bytes::from_static(b"world").into()));
+        upload.complete().await.unwrap();
+
+        let read_data = integration
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(&*read_data, b"hello world");
     }
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";

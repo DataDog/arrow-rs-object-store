@@ -173,20 +173,25 @@ impl PutPayload {
                     move |state| async move {
                         use tokio::io::AsyncReadExt;
 
-                        let mut file = match state {
-                            FileStreamState::Open(path) => {
-                                tokio::fs::File::open(path.as_ref()).await?
-                            }
-                            FileStreamState::Reading(file) => file,
+                        let (mut file, mut buffer) = match state {
+                            FileStreamState::Open(path) => (
+                                tokio::fs::File::open(path.as_ref()).await?,
+                                bytes::BytesMut::new(),
+                            ),
+                            FileStreamState::Reading(file, buffer) => (file, buffer),
                         };
 
-                        let mut buffer = vec![0; chunk_size];
-                        let read = file.read(&mut buffer).await?;
+                        // Reads into uninitialized spare capacity, which a short
+                        // read leaves for the next read rather than pinning it
+                        buffer.reserve(chunk_size);
+                        let read = file
+                            .read_buf(&mut bytes::BufMut::limit(&mut buffer, chunk_size))
+                            .await?;
                         if read == 0 {
                             return Ok::<_, std::io::Error>(None);
                         }
-                        buffer.truncate(read);
-                        Ok(Some((Bytes::from(buffer), FileStreamState::Reading(file))))
+                        let chunk = buffer.split().freeze();
+                        Ok(Some((chunk, FileStreamState::Reading(file, buffer))))
                     },
                 )
             },
@@ -231,11 +236,17 @@ impl PutPayload {
                     buffer.into()
                 }
             }),
-            PutPayloadInner::Streaming { .. } => {
+            PutPayloadInner::Streaming { content_length, .. } => {
                 let mut stream = self.stream();
-                let mut buffer = Vec::with_capacity(self.content_length());
+                let mut buffer = Vec::with_capacity(*content_length);
                 while let Some(chunk) = futures_util::TryStreamExt::try_next(&mut stream).await? {
                     buffer.extend_from_slice(&chunk);
+                    if buffer.len() > *content_length {
+                        return Err(content_length_mismatch(*content_length, buffer.len()));
+                    }
+                }
+                if buffer.len() != *content_length {
+                    return Err(content_length_mismatch(*content_length, buffer.len()));
                 }
                 Ok(buffer.into())
             }
@@ -257,10 +268,20 @@ impl PutPayload {
     }
 }
 
+/// The error of a streaming payload yielding `read` bytes instead of `content_length`
+fn content_length_mismatch(content_length: usize, read: usize) -> PutPayloadError {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "streaming payload does not match its content length of {content_length} bytes, read {read}"
+        ),
+    ))
+}
+
 #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 enum FileStreamState {
     Open(Arc<std::path::PathBuf>),
-    Reading(tokio::fs::File),
+    Reading(tokio::fs::File, bytes::BytesMut),
 }
 
 impl AsRef<[Bytes]> for PutPayload {
@@ -569,5 +590,29 @@ mod test {
             );
             assert_eq!(chunks.concat(), data);
         }
+    }
+
+    #[tokio::test]
+    async fn test_bytes_checks_content_length() {
+        use bytes::Bytes;
+
+        let payload_of = |data: &'static [u8], content_length| {
+            crate::PutPayload::from_stream(
+                move || {
+                    futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(data))])
+                },
+                content_length,
+            )
+        };
+
+        assert_eq!(payload_of(b"abcd", 4).bytes().await.unwrap(), b"abcd"[..]);
+        let err = payload_of(b"abc", 4).bytes().await.unwrap_err().to_string();
+        assert!(err.contains("content length of 4 bytes, read 3"), "{err}");
+        let err = payload_of(b"abcde", 4)
+            .bytes()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("content length of 4 bytes, read 5"), "{err}");
     }
 }
