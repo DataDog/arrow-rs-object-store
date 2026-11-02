@@ -217,11 +217,26 @@ jobs:
 
       # MinIO validates SigV4 (LocalStack does not), so it backs the presigned-URL
       # signature-enforcement tests below.
+      # Upstream container images are no longer publicly pullable. Build the
+      # pinned upstream release instead of relying on a third-party image.
+      - name: Setup Go for MinIO
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.24.8'
+          cache: false
+
+      - name: Build MinIO
+        env:
+          GOBIN: ${{ runner.temp }}/minio-bin
+        run: go install github.com/minio/minio@RELEASE.2025-10-15T17-29-55Z
+
       - name: Setup MinIO (SigV4-validating S3)
         run: |
-          MINIO_CONTAINER=$(docker run -d -p 9000:9000 -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio123 minio/minio server /data)
-          echo "MINIO_CONTAINER=$MINIO_CONTAINER" >> $GITHUB_ENV
-          for _ in $(seq 1 30); do curl -fsS http://localhost:9000/minio/health/ready && break; sleep 1; done
+          MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=minio123 \
+            nohup "$RUNNER_TEMP/minio-bin/minio" server "$RUNNER_TEMP/minio-data" \
+            --address 127.0.0.1:9000 > "$RUNNER_TEMP/minio.log" 2>&1 &
+          curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused \
+            http://localhost:9000/minio/health/ready
           AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123 \
             aws --endpoint-url=http://localhost:9000 s3 mb s3://test-bucket-for-signing
 
@@ -276,24 +291,24 @@ jobs:
         run: env -u TEST_INTEGRATION cargo test --lib --tests --no-default-features --features fs,aws-base,azure-base,gcp-base,http-base,reqwest,reqwest/native-tls,ring
 
       - name: GCS Output
-        if: ${{ !cancelled() }}
-        run: docker logs $GCS_CONTAINER
+        if: ${{ !cancelled() && env.GCS_CONTAINER != '' }}
+        run: docker logs "$GCS_CONTAINER"
 
       - name: LocalStack Output
-        if: ${{ !cancelled() }}
-        run: docker logs $LOCALSTACK_CONTAINER
+        if: ${{ !cancelled() && env.LOCALSTACK_CONTAINER != '' }}
+        run: docker logs "$LOCALSTACK_CONTAINER"
 
       - name: MinIO Output
         if: ${{ !cancelled() }}
-        run: docker logs $MINIO_CONTAINER
+        run: test ! -f "$RUNNER_TEMP/minio.log" || cat "$RUNNER_TEMP/minio.log"
 
       - name: EC2 Metadata Output
-        if: ${{ !cancelled() }}
-        run: docker logs $EC2_METADATA_CONTAINER
+        if: ${{ !cancelled() && env.EC2_METADATA_CONTAINER != '' }}
+        run: docker logs "$EC2_METADATA_CONTAINER"
 
       - name: Azurite Output
-        if: ${{ !cancelled() }}
-        run: docker logs $AZURITE_CONTAINER
+        if: ${{ !cancelled() && env.AZURITE_CONTAINER != '' }}
+        run: docker logs "$AZURITE_CONTAINER"
 
   # test the object_store crate builds against wasm32 in stable rust
   wasm32-build:

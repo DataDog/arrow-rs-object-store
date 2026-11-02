@@ -165,6 +165,12 @@ impl HttpClient {
 
     /// Performs [`HttpRequest`] using this client
     pub async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        if let Some(payload) = request.body().empty_streaming_payload() {
+            payload
+                .bytes()
+                .await
+                .map_err(|e| HttpError::new_boxed(HttpErrorKind::Unknown, e))?;
+        }
         self.0.call(request).await
     }
 
@@ -245,10 +251,11 @@ impl HttpService for reqwest::Client {
         use wasm_bindgen_futures::spawn_local;
 
         let (parts, body) = req.into_parts();
+        let body = body.into_reqwest().await?;
         let url = parts.uri.to_string().parse().unwrap();
         let mut req = reqwest::Request::new(parts.method, url);
         *req.headers_mut() = parts.headers;
-        *req.body_mut() = Some(body.into_reqwest());
+        *req.body_mut() = Some(body);
 
         let (mut tx, rx) = mpsc::channel(1);
         let (tx_parts, rx_parts) = oneshot::channel();
