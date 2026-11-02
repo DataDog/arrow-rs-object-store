@@ -213,12 +213,18 @@ impl PutPayload {
     }
 
     /// Returns a new stream over this payload.
+    ///
+    /// The stream of a streaming payload fails if it yields more or fewer bytes
+    /// than its content length.
     pub fn stream(&self) -> PutPayloadStream {
         match &self.0 {
             PutPayloadInner::Bytes(bytes) => {
                 futures_util::stream::iter(bytes.as_ref().to_vec().into_iter().map(Ok)).boxed()
             }
-            PutPayloadInner::Streaming { factory, .. } => factory(),
+            PutPayloadInner::Streaming {
+                factory,
+                content_length,
+            } => validate_content_length(factory(), *content_length),
         }
     }
 
@@ -241,12 +247,6 @@ impl PutPayload {
                 let mut buffer = Vec::with_capacity(*content_length);
                 while let Some(chunk) = futures_util::TryStreamExt::try_next(&mut stream).await? {
                     buffer.extend_from_slice(&chunk);
-                    if buffer.len() > *content_length {
-                        return Err(content_length_mismatch(*content_length, buffer.len()));
-                    }
-                }
-                if buffer.len() != *content_length {
-                    return Err(content_length_mismatch(*content_length, buffer.len()));
                 }
                 Ok(buffer.into())
             }
@@ -266,6 +266,47 @@ impl PutPayload {
             }
         }
     }
+}
+
+/// Fails `source` if it yields more or fewer than `content_length` bytes
+///
+/// The chunk completing `content_length` is held back until `source` ends, so
+/// that excess data or a trailing error fails the stream. Without this, a
+/// consumer that stops after `content_length` bytes, like an HTTP body with a
+/// `Content-Length`, would drop them and report success.
+fn validate_content_length(source: PutPayloadStream, content_length: usize) -> PutPayloadStream {
+    use futures_util::TryStreamExt;
+
+    futures_util::stream::try_unfold(Some((source, 0)), move |state| async move {
+        let Some((mut source, mut read)) = state else {
+            return Ok(None);
+        };
+        loop {
+            let Some(chunk) = source.try_next().await? else {
+                return match read == content_length {
+                    true => Ok(None),
+                    false => Err(content_length_mismatch(content_length, read)),
+                };
+            };
+            if chunk.is_empty() {
+                continue;
+            }
+            read += chunk.len();
+            if read < content_length {
+                return Ok(Some((chunk, Some((source, read)))));
+            }
+            if read > content_length {
+                return Err(content_length_mismatch(content_length, read));
+            }
+            while let Some(excess) = source.try_next().await? {
+                if !excess.is_empty() {
+                    return Err(content_length_mismatch(content_length, read + excess.len()));
+                }
+            }
+            return Ok(Some((chunk, None)));
+        }
+    })
+    .boxed()
 }
 
 /// The error of a streaming payload yielding `read` bytes instead of `content_length`
@@ -614,5 +655,61 @@ mod test {
             .unwrap_err()
             .to_string();
         assert!(err.contains("content length of 4 bytes, read 5"), "{err}");
+    }
+
+    /// The chunk completing the content length must not be yielded before the
+    /// source ends, or a consumer stopping at the content length misses the error
+    #[tokio::test]
+    async fn test_stream_holds_final_chunk_until_source_ends() {
+        use bytes::Bytes;
+        use futures_util::{StreamExt, TryStreamExt};
+
+        let excess = crate::PutPayload::from_stream(
+            || {
+                futures_util::stream::iter(
+                    ["abc", "def"]
+                        .map(|s| Ok::<_, std::io::Error>(Bytes::from_static(s.as_bytes()))),
+                )
+            },
+            3,
+        );
+        let err = excess
+            .stream()
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("content length of 3 bytes, read 6"), "{err}");
+
+        let trailing_error = crate::PutPayload::from_stream(
+            || {
+                futures_util::stream::iter([
+                    Ok(Bytes::from_static(b"abc")),
+                    Err(std::io::Error::other("trailing failure")),
+                ])
+            },
+            3,
+        );
+        let err = trailing_error
+            .stream()
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("trailing failure"), "{err}");
+
+        let exact = crate::PutPayload::from_stream(
+            || {
+                futures_util::stream::iter(
+                    ["ab", "", "c", ""]
+                        .map(|s| Ok::<_, std::io::Error>(Bytes::from_static(s.as_bytes()))),
+                )
+            },
+            3,
+        );
+        let chunks: Vec<Bytes> = exact.stream().try_collect().await.unwrap();
+        assert_eq!(chunks.concat(), b"abc");
     }
 }

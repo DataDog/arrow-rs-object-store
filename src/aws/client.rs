@@ -1267,6 +1267,48 @@ mod tests {
         mock.shutdown().await;
     }
 
+    /// An unsigned streaming upload is sent with a plain `Content-Length`, which
+    /// the HTTP client stops at: excess data must fail the upload, not be dropped
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_unsigned_streaming_payload_rejects_excess_data() {
+        use http_body_util::BodyExt;
+        use std::io;
+
+        let mock = MockServer::new().await;
+        mock.push_async_fn(|req| async move {
+            // The upload must be aborted before its body completes
+            assert!(req.into_body().collect().await.is_err());
+            Response::new(String::new())
+        });
+
+        let mut config = default_headers_config(&mock);
+        config.retry_config.max_retries = 0;
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+
+        let payload = PutPayload::from_stream(
+            || {
+                futures_util::stream::iter(
+                    ["abc", "def"].map(|s| Ok::<_, io::Error>(Bytes::from_static(s.as_bytes()))),
+                )
+            },
+            3,
+        );
+        let err = client
+            .request(Method::PUT, &Path::from("test"))
+            .with_payload(payload)
+            .await
+            .unwrap()
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("content length of 3 bytes, read 6"),
+            "{err:?}"
+        );
+        mock.shutdown().await;
+    }
+
     #[cfg(all(feature = "reqwest", any(feature = "aws-lc-rs", feature = "ring")))]
     #[tokio::test]
     async fn test_streaming_payload_aws_chunked() {
