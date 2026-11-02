@@ -165,6 +165,12 @@ impl HttpClient {
 
     /// Performs [`HttpRequest`] using this client
     pub async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        if let Some(payload) = request.body().empty_streaming_payload() {
+            payload
+                .bytes()
+                .await
+                .map_err(|e| HttpError::new_boxed(HttpErrorKind::Unknown, e))?;
+        }
         self.0.call(request).await
     }
 

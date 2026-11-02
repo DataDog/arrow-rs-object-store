@@ -1309,6 +1309,38 @@ mod tests {
         mock.shutdown().await;
     }
 
+    /// A client never polls an empty body, so an empty streaming payload must be
+    /// validated before its request is sent
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_unsigned_empty_streaming_payload_rejects_data() {
+        use std::io;
+
+        let mock = MockServer::new().await;
+        let mut config = default_headers_config(&mock);
+        config.retry_config.max_retries = 0;
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+
+        let payload = PutPayload::from_stream(
+            || futures_util::stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"abc"))]),
+            0,
+        );
+        let err = client
+            .request(Method::PUT, &Path::from("test"))
+            .with_payload(payload)
+            .await
+            .unwrap()
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("content length of 0 bytes, read 3"),
+            "{err:?}"
+        );
+        // No response was queued: the request must not have reached the server
+        mock.shutdown().await;
+    }
+
     #[cfg(all(feature = "reqwest", any(feature = "aws-lc-rs", feature = "ring")))]
     #[tokio::test]
     async fn test_streaming_payload_aws_chunked() {

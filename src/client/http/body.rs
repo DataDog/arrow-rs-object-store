@@ -76,6 +76,20 @@ impl HttpRequestBody {
         Ok(bytes.into())
     }
 
+    /// Returns the payload of this body if it is an empty streaming payload
+    ///
+    /// A client sends an empty body with `Content-Length: 0` without polling it,
+    /// so the length validation of [`PutPayload::stream`] never runs for it: it
+    /// must be validated before the request is sent.
+    pub(crate) fn empty_streaming_payload(&self) -> Option<PutPayload> {
+        match &self.0 {
+            Inner::Streaming(body) if body.payload.content_length() == 0 => {
+                Some(body.payload.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Returns true if this body is empty
     pub fn is_empty(&self) -> bool {
         match &self.0 {
